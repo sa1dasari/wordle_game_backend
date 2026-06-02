@@ -1,7 +1,8 @@
-const express = require('express');
-const http    = require('http');
+const express  = require('express');
+const http     = require('http');
 const { Server } = require('socket.io');
-const cors    = require('cors');
+const cors     = require('cors');
+const fetch    = require('node-fetch');
 
 const app    = express();
 const server = http.createServer(app);
@@ -12,10 +13,9 @@ const io     = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Health check — Railway/Render ping this
 app.get('/', (req, res) => res.send('Wordle Duel server running ✅'));
 
-// ── Word list (curated 5-letter words) ────────────────────────────────────────
+// ── Word list ─────────────────────────────────────────────────────────────────
 const WORDS = [
     'ABOUT','ABOVE','ABUSE','ADMIT','ADOPT','ADULT','AFTER','AGAIN','AGENT','AGREE',
     'AHEAD','ALARM','ALBUM','ALERT','ALIKE','ALIVE','ALLOW','ALONE','ALONG','ALTER',
@@ -111,53 +111,76 @@ const WORDS = [
     'ZESTY','ZONAL'
 ];
 
+const WORD_SET = new Set(WORDS);
+
 function randomWord() {
     return WORDS[Math.floor(Math.random() * WORDS.length)];
 }
 
-// ── Room state ─────────────────────────────────────────────────────────────────
-// rooms: Map<roomCode, RoomState>
+// ── Dictionary validation ─────────────────────────────────────────────────────
+// Check WORD_SET first (instant), then fall back to Free Dictionary API
+async function isValidWord(word) {
+    if (WORD_SET.has(word)) return true;
+    try {
+        const res = await fetch(
+            `https://api.dictionaryapi.dev/api/v2/entries/en/${word.toLowerCase()}`,
+            { timeout: 3000 }
+        );
+        return res.ok;
+    } catch {
+        // API unreachable — fail open so game doesn't freeze
+        return true;
+    }
+}
+
+// ── Room helpers ──────────────────────────────────────────────────────────────
 const rooms = new Map();
 
 function makeRoomCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
     for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
-    return rooms.has(code) ? makeRoomCode() : code; // ensure unique
+    return rooms.has(code) ? makeRoomCode() : code;
 }
 
 function evaluateGuess(guess, secret) {
-    const result      = Array(5).fill('absent');
-    const secretArr   = secret.split('');
-    const guessArr    = guess.split('');
-    const usedSecret  = Array(5).fill(false);
-    const usedGuess   = Array(5).fill(false);
+    const result     = Array(5).fill('absent');
+    const secretArr  = secret.split('');
+    const guessArr   = guess.split('');
+    const usedSecret = Array(5).fill(false);
+    const usedGuess  = Array(5).fill(false);
 
-    // Pass 1: correct
     for (let i = 0; i < 5; i++) {
         if (guessArr[i] === secretArr[i]) {
-            result[i]      = 'correct';
-            usedSecret[i]  = true;
-            usedGuess[i]   = true;
+            result[i] = 'correct';
+            usedSecret[i] = usedGuess[i] = true;
         }
     }
-
-    // Pass 2: present
     for (let i = 0; i < 5; i++) {
         if (usedGuess[i]) continue;
         for (let j = 0; j < 5; j++) {
             if (!usedSecret[j] && guessArr[i] === secretArr[j]) {
-                result[i]     = 'present';
+                result[i] = 'present';
                 usedSecret[j] = true;
                 break;
             }
         }
     }
-
     return result;
 }
 
-// ── Socket events ──────────────────────────────────────────────────────────────
+function resetRoom(room, swapTurn = false) {
+    room.word         = randomWord();
+    room.guesses      = [];
+    room.winner       = null;
+    room.rematchVotes = new Set();
+    room.newWordVotes = new Set();
+    room.players.forEach(p => p.guessCount = 0);
+    if (swapTurn) room.players = [room.players[1], room.players[0]];
+    room.currentTurn = room.players[0].id;
+}
+
+// ── Socket events ─────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
     console.log('connected:', socket.id);
 
@@ -166,58 +189,44 @@ io.on('connection', (socket) => {
         const code = makeRoomCode();
         rooms.set(code, {
             code,
-            word: randomWord(),
-            players: [{ id: socket.id, name: playerName, guessCount: 0 }],
-            guesses: [],          // shared guess log
-            currentTurn: null,    // set when game starts
-            started: false,
-            winner: null,
+            word:         randomWord(),
+            players:      [{ id: socket.id, name: playerName, guessCount: 0 }],
+            guesses:      [],
+            currentTurn:  null,
+            started:      false,
+            winner:       null,
+            rematchVotes: new Set(),
+            newWordVotes: new Set(),
         });
         socket.join(code);
         socket.roomCode = code;
         socket.emit('room_created', { code });
-        console.log(`Room ${code} created by ${playerName}`);
     });
 
     // ── Join room ──
     socket.on('join_room', ({ roomCode, playerName }) => {
         const room = rooms.get(roomCode);
-
-        if (!room) {
-            socket.emit('error', { message: 'Room not found.' });
-            return;
-        }
-        if (room.started) {
-            socket.emit('error', { message: 'Game already in progress.' });
-            return;
-        }
-        if (room.players.length >= 2) {
-            socket.emit('error', { message: 'Room is full.' });
-            return;
-        }
+        if (!room)                    { socket.emit('error', { message: 'Room not found.' }); return; }
+        if (room.started)             { socket.emit('error', { message: 'Game already in progress.' }); return; }
+        if (room.players.length >= 2) { socket.emit('error', { message: 'Room is full.' }); return; }
 
         room.players.push({ id: socket.id, name: playerName, guessCount: 0 });
         socket.join(roomCode);
-        socket.roomCode = roomCode;
-
-        // Both players in — start the game
+        socket.roomCode  = roomCode;
         room.started     = true;
-        room.currentTurn = room.players[0].id; // creator goes first
+        room.currentTurn = room.players[0].id;
 
         io.to(roomCode).emit('game_start', {
             players:     room.players.map(p => ({ id: p.id, name: p.name })),
             currentTurn: room.currentTurn,
         });
-
-        console.log(`Room ${roomCode} started: ${room.players.map(p=>p.name).join(' vs ')}`);
     });
 
-    // ── Submit guess ──
-    socket.on('submit_guess', ({ guess }) => {
+    // ── Submit guess (async — validates word server-side) ──
+    socket.on('submit_guess', async ({ guess }) => {
         const room = rooms.get(socket.roomCode);
         if (!room || !room.started || room.winner) return;
 
-        // Validate it's this player's turn
         if (room.currentTurn !== socket.id) {
             socket.emit('error', { message: "It's not your turn." });
             return;
@@ -226,10 +235,17 @@ io.on('connection', (socket) => {
         guess = guess.toUpperCase().trim();
         if (guess.length !== 5) return;
 
+        // ── Dictionary validation ──
+        const valid = await isValidWord(guess);
+        if (!valid) {
+            // Only reject to the guesser — don't interrupt the other player
+            socket.emit('invalid_word', { message: 'Not a valid word!' });
+            return;
+        }
+
         const result    = evaluateGuess(guess, room.word);
         const player    = room.players.find(p => p.id === socket.id);
         const isCorrect = result.every(r => r === 'correct');
-
         player.guessCount++;
 
         const guessEntry = {
@@ -237,9 +253,8 @@ io.on('connection', (socket) => {
             playerName: player.name,
             guess,
             result,
-            guessNum:   player.guessCount,
+            guessNum: player.guessCount,
         };
-
         room.guesses.push(guessEntry);
 
         if (isCorrect) {
@@ -249,47 +264,80 @@ io.on('connection', (socket) => {
                 winnerId:   socket.id,
                 winnerName: player.name,
                 word:       room.word,
-                guesses:    room.guesses,
             });
-            console.log(`Room ${room.code} won by ${player.name} in ${player.guessCount} guesses`);
         } else {
-            // Switch turn to the other player
-            const other      = room.players.find(p => p.id !== socket.id);
-            room.currentTurn = other.id;
+            room.currentTurn = room.players.find(p => p.id !== socket.id).id;
             io.to(room.code).emit('guess_result', guessEntry);
             io.to(room.code).emit('turn_change', { currentTurn: room.currentTurn });
         }
     });
 
-    // ── Rematch ──
+    // ── Rematch vote — starts only when BOTH players vote ──
     socket.on('rematch', () => {
         const room = rooms.get(socket.roomCode);
         if (!room) return;
 
-        room.word        = randomWord();
-        room.guesses     = [];
-        room.winner      = null;
-        // Swap who goes first for fairness
-        room.players     = [room.players[1], room.players[0]];
-        room.currentTurn = room.players[0].id;
+        room.rematchVotes.add(socket.id);
 
-        io.to(room.code).emit('game_start', {
-            players:     room.players.map(p => ({ id: p.id, name: p.name })),
-            currentTurn: room.currentTurn,
-        });
+        if (room.rematchVotes.size === 1) {
+            // Notify only the OTHER player
+            const other = room.players.find(p => p.id !== socket.id);
+            if (other) {
+                io.to(other.id).emit('rematch_pending', {
+                    voterName: room.players.find(p => p.id === socket.id)?.name,
+                });
+            }
+        }
+
+        if (room.rematchVotes.size === 2) {
+            resetRoom(room, true); // swap first turn
+            io.to(room.code).emit('game_start', {
+                players:     room.players.map(p => ({ id: p.id, name: p.name })),
+                currentTurn: room.currentTurn,
+            });
+        }
+    });
+
+    // ── New word vote — starts only when BOTH players vote ──
+    socket.on('new_word', () => {
+        const room = rooms.get(socket.roomCode);
+        if (!room) return;
+
+        room.newWordVotes.add(socket.id);
+
+        if (room.newWordVotes.size === 1) {
+            const other = room.players.find(p => p.id !== socket.id);
+            if (other) {
+                io.to(other.id).emit('new_word_pending', {
+                    voterName: room.players.find(p => p.id === socket.id)?.name,
+                });
+            }
+        }
+
+        if (room.newWordVotes.size === 2) {
+            resetRoom(room, false); // keep same turn order
+            io.to(room.code).emit('game_start', {
+                players:     room.players.map(p => ({ id: p.id, name: p.name })),
+                currentTurn: room.currentTurn,
+            });
+        }
+    });
+
+    // ── Exit room ──
+    socket.on('exit_room', () => {
+        const room = rooms.get(socket.roomCode);
+        if (!room) return;
+        io.to(room.code).emit('opponent_left', { message: 'Your opponent left the room.' });
+        rooms.delete(room.code);
     });
 
     // ── Disconnect ──
     socket.on('disconnect', () => {
         const room = rooms.get(socket.roomCode);
         if (!room) return;
-
-        io.to(room.code).emit('opponent_left', {
-            message: 'Your opponent disconnected.',
-        });
-
+        io.to(room.code).emit('opponent_left', { message: 'Your opponent disconnected.' });
         rooms.delete(room.code);
-        console.log(`Room ${room.code} closed — player disconnected`);
+        console.log(`Room ${room.code} closed`);
     });
 });
 
