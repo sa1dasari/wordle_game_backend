@@ -323,6 +323,17 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ── Typing indicator ──
+    // Forward typing state to the OTHER player only
+    socket.on('typing', ({ isTyping }) => {
+        const room = rooms.get(socket.roomCode);
+        if (!room || !room.started || room.winner) return;
+        const other = room.players.find(p => p.id !== socket.id);
+        if (other) {
+            io.to(other.id).emit('opponent_typing', { isTyping });
+        }
+    });
+
     // ── Exit room ──
     socket.on('exit_room', () => {
         const room = rooms.get(socket.roomCode);
