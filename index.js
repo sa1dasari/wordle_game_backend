@@ -509,9 +509,9 @@ io.on('connection', (socket) => {
         const room = rooms.get(socket.roomCode);
         if (!room || room.type !== 'party' || room.phase !== 'setting' || socket.id !== room.currentSetter) return;
         word = word.toUpperCase().trim();
-        if (word.length !== room.wordLength) { socket.emit('party_error', { message:`Word must be ${room.wordLength} letters.` }); return; }
+        if (word.length !== room.wordLength) { socket.emit('party_set_error', { message:`Word must be ${room.wordLength} letters.` }); return; }
         const valid = await isValidWord(word);
-        if (!valid) { socket.emit('party_error', { message:'Not a valid word. Try another.' }); return; }
+        if (!valid) { socket.emit('party_set_error', { message:'Not a valid word. Try another.' }); return; }
         room.currentWord = word;
         startGuessingPhase(room);
     });
