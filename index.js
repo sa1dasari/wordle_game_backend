@@ -16,6 +16,22 @@ app.use(cors());
 app.use(express.json());
 app.get('/', (req, res) => res.send('Wordle server running ✅ — Duel + Party modes active'));
 
+// Keep-alive: ping self every 5 minutes so Railway doesn't spin down
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `http://localhost:${process.env.PORT || 3000}`;
+
+setInterval(() => {
+    const http = require('http');
+    const https = require('https');
+    const client = SELF_URL.startsWith('https') ? https : http;
+    client.get(SELF_URL, (res) => {
+        console.log(`Keep-alive ping: ${res.statusCode}`);
+    }).on('error', (err) => {
+        console.warn('Keep-alive ping failed:', err.message);
+    });
+}, 5 * 60 * 1000); // every 5 minutes
+
 // ── Shared word lists & helpers ───────────────────────────────────────────────
 const WORDS5 = [
     'ABOUT','ABOVE','ABUSE','ADMIT','ADOPT','ADULT','AFTER','AGAIN','AGENT','AGREE',
@@ -544,23 +560,40 @@ io.on('connection', (socket) => {
         if (!room) return;
 
         if (room.type === 'duel') {
-            io.to(room.code).emit('opponent_left', { message:'Your opponent disconnected.' });
+            // Only notify + delete if game was actually started
+            if (room.started) {
+                io.to(room.code).emit('opponent_left', { message:'Your opponent disconnected.' });
+            }
             rooms.delete(room.code);
         } else if (room.type === 'party') {
             const player = room.players.get(socket.id);
+            const playerName = player?.name || 'A player';
             room.players.delete(socket.id);
-            broadcastChat(room, null, `${player?.name || 'A player'} left.`);
-            if (room.players.size === 0) { clearPartyTimers(room); rooms.delete(room.code); return; }
+
+            // If room is now empty, clean up
+            if (room.players.size === 0) {
+                clearPartyTimers(room);
+                rooms.delete(room.code);
+                return;
+            }
+
+            // If host left, assign new host
             if (socket.id === room.hostId) {
                 room.hostId = [...room.players.keys()][0];
                 io.to(room.hostId).emit('party_host_assigned');
             }
-            emitLobbyState(room);
-            if (room.phase === 'setting' && socket.id === room.currentSetter) {
-                broadcastChat(room, null, 'Setter left — skipping round.');
-                setTimeout(() => startNextRound(room), 2000);
+
+            // Only broadcast chat during active game, not lobby
+            if (room.phase !== 'lobby') {
+                broadcastChat(room, null, `${playerName} left.`);
+                if (room.phase === 'setting' && socket.id === room.currentSetter) {
+                    broadcastChat(room, null, 'Setter left — skipping round.');
+                    setTimeout(() => startNextRound(room), 2000);
+                }
+                if (room.phase === 'guessing') checkRoundEnd(room);
             }
-            if (room.phase === 'guessing') checkRoundEnd(room);
+
+            emitLobbyState(room);
         }
         console.log(`Room ${room.code} — player disconnected`);
     });
