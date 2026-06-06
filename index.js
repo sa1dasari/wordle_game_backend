@@ -478,7 +478,7 @@ io.on('connection', (socket) => {
             setterOrder:[], setterIndex:0, currentSetter:null, currentWord:'',
             hintsRevealed:[], guesserState:new Map(),
             roundTimer:null, setterPickTimer:null,
-            chat:[], roundNumber:0, timeLeft:0,
+            chat:[], roundNumber:0, timeLeft:0, nextRoundVotes: new Set(),
         });
         socket.join(code); socket.roomCode = code;
         socket.emit('party_room_created', { code });
@@ -542,6 +542,31 @@ io.on('connection', (socket) => {
             io.to(room.code).emit('party_player_failed', { playerId:socket.id, playerName:player.name });
         }
         checkRoundEnd(room);
+    });
+
+    // ── Next round vote — both players must click before round starts ──
+    socket.on('party_next_round', () => {
+        const room = rooms.get(socket.roomCode);
+        if (!room || room.type !== 'party' || room.phase !== 'results') return;
+
+        room.nextRoundVotes.add(socket.id);
+
+        if (room.nextRoundVotes.size === 1) {
+            // Tell the other player(s) someone is ready
+            const voter = room.players.get(socket.id);
+            io.to(room.code).emit('party_next_round_pending', {
+                voterName: voter?.name,
+                voterId:   socket.id,
+                total:     room.players.size,
+                votes:     room.nextRoundVotes.size,
+            });
+        }
+
+        if (room.nextRoundVotes.size >= room.players.size) {
+            // Everyone ready — start next round
+            room.nextRoundVotes = new Set();
+            startNextRound(room);
+        }
     });
 
     socket.on('party_chat', ({ message }) => {
