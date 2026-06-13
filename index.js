@@ -7,6 +7,18 @@ const http     = require('http');
 const { Server } = require('socket.io');
 const cors     = require('cors');
 const fetch    = require('node-fetch');
+const { createClient } = require('@supabase/supabase-js');
+
+// ── Supabase client (service_role key — bypasses RLS for server-side writes) ──
+const SUPABASE_URL  = process.env.SUPABASE_URL;
+const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = (SUPABASE_URL && SUPABASE_KEY)
+    ? createClient(SUPABASE_URL, SUPABASE_KEY)
+    : null;
+
+if (!supabase) {
+    console.warn('⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — Daily mode endpoints will be disabled.');
+}
 
 const app    = express();
 const server = http.createServer(app);
@@ -223,6 +235,239 @@ function evaluateGuess(guess, secret) {
     }
     return result;
 }
+
+// ─────────────────────────────────────────────────────
+// DAILY MODE — server-side daily word + leaderboard
+// ─────────────────────────────────────────────────────
+
+// Curated answer list — same pool as WORDS5, but this is the list that
+// gets indexed by date. Keeping it separate so you can swap in a
+// hand-picked "good answers" list later without affecting guess validation.
+const ANSWER_WORDS = WORDS5;
+
+// Epoch date — day 0 of the daily word rotation
+const DAILY_EPOCH = new Date('2024-01-01T00:00:00Z');
+
+function getDailyWordIndex(date = new Date()) {
+    const utcDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const daysSinceEpoch = Math.floor((utcDate - DAILY_EPOCH) / (1000 * 60 * 60 * 24));
+    return ((daysSinceEpoch % ANSWER_WORDS.length) + ANSWER_WORDS.length) % ANSWER_WORDS.length;
+}
+
+function getTodaysWord() {
+    return ANSWER_WORDS[getDailyWordIndex()];
+}
+
+function getTodayDateString() {
+    const d = new Date();
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
+        .toISOString().split('T')[0]; // YYYY-MM-DD
+}
+
+// In-memory per-session guess tracking (keyed by user_id)
+// Tracks how many guesses a user has made today + their guess history
+// This is ephemeral — if server restarts mid-day, users could replay,
+// but the unique(user_id, play_date) DB constraint prevents double-scoring.
+const dailySessions = new Map(); // user_id -> { guesses: [], startedAt }
+
+function getDailySession(userId) {
+    if (!dailySessions.has(userId)) {
+        dailySessions.set(userId, { guesses: [], startedAt: Date.now() });
+    }
+    return dailySessions.get(userId);
+}
+
+// Verify a Supabase JWT and return the user, or null
+async function getUserFromToken(req) {
+    if (!supabase) return null;
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace('Bearer ', '');
+    if (!token) return null;
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
+}
+
+// ── GET /api/daily/status — has this user already played today? ──────────
+app.get('/api/daily/status', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const user = await getUserFromToken(req);
+    if (!user) return res.status(401).json({ error: 'Not authenticated.' });
+
+    const today = getTodayDateString();
+    const { data, error } = await supabase
+        .from('daily_results')
+        .select('guess_count, solved, guesses')
+        .eq('user_id', user.id)
+        .eq('play_date', today)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    if (data) {
+        return res.json({ played: true, result: data });
+    }
+
+    // Not played yet — return current in-progress session (if any)
+    const session = dailySessions.get(user.id);
+    res.json({
+        played: false,
+        wordLength: 5,
+        guesses: session?.guesses || [],
+    });
+});
+
+// ── POST /api/daily/guess — submit a guess for today's word ──────────────
+app.post('/api/daily/guess', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const user = await getUserFromToken(req);
+    if (!user) return res.status(401).json({ error: 'Not authenticated.' });
+
+    const { guess } = req.body;
+    if (!guess || typeof guess !== 'string') {
+        return res.status(400).json({ error: 'Missing guess.' });
+    }
+
+    const today = getTodayDateString();
+
+    // Check if already completed today
+    const { data: existing } = await supabase
+        .from('daily_results')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('play_date', today)
+        .maybeSingle();
+
+    if (existing) {
+        return res.status(403).json({ error: "You've already played today's word." });
+    }
+
+    const word = getTodaysWord();
+    const upperGuess = guess.toUpperCase().trim();
+
+    if (upperGuess.length !== 5) {
+        return res.status(400).json({ error: 'Guess must be 5 letters.' });
+    }
+
+    const valid = await isValidWord(upperGuess);
+    if (!valid) {
+        return res.status(400).json({ error: 'Not a valid word.', invalid: true });
+    }
+
+    const session = getDailySession(user.id);
+
+    // Prevent replay/extra guesses beyond 6
+    if (session.guesses.length >= 6) {
+        return res.status(403).json({ error: 'No guesses remaining.' });
+    }
+
+    const result = evaluateGuess(upperGuess, word);
+    const isCorrect = result.every(r => r === 'correct');
+    session.guesses.push({ guess: upperGuess, result });
+
+    const guessCount = session.guesses.length;
+    const gameOver   = isCorrect || guessCount >= 6;
+
+    let response = { guess: upperGuess, result, guessCount, isCorrect, gameOver };
+
+    if (gameOver) {
+        const timeTaken = Math.round((Date.now() - session.startedAt) / 1000);
+
+        // Save result to Supabase
+        const { error: insertError } = await supabase.from('daily_results').insert({
+            user_id: user.id,
+            play_date: today,
+            guesses: session.guesses,
+            guess_count: isCorrect ? guessCount : 7, // 7 = failed convention
+            solved: isCorrect,
+            time_taken_seconds: timeTaken,
+        });
+
+        if (insertError) {
+            console.error('Failed to save daily result:', insertError.message);
+        }
+
+        // Reveal the word on game over
+        response.word = word;
+
+        // Clear session
+        dailySessions.delete(user.id);
+    }
+
+    res.json(response);
+});
+
+// ── GET /api/daily/leaderboard — today's leaderboard ──────────────────────
+app.get('/api/daily/leaderboard', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const { data, error } = await supabase
+        .from('leaderboard_today')
+        .select('*')
+        .limit(50);
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ leaderboard: data });
+});
+
+// ── GET /api/daily/leaderboard/alltime — all-time leaderboard ────────────
+app.get('/api/daily/leaderboard/alltime', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const { data, error } = await supabase
+        .from('leaderboard_alltime')
+        .select('*')
+        .limit(50);
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ leaderboard: data });
+});
+
+// ── POST /api/profile — create/update username ───────────────────────────
+app.post('/api/profile', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const user = await getUserFromToken(req);
+    if (!user) return res.status(401).json({ error: 'Not authenticated.' });
+
+    const { username } = req.body;
+    if (!username || !/^[a-zA-Z0-9_]{3,16}$/.test(username)) {
+        return res.status(400).json({ error: 'Username must be 3-16 characters (letters, numbers, underscore).' });
+    }
+
+    const { error } = await supabase
+        .from('profiles')
+        .upsert({ id: user.id, username }, { onConflict: 'id' });
+
+    if (error) {
+        if (error.code === '23505') { // unique violation
+            return res.status(409).json({ error: 'Username already taken.' });
+        }
+        return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true, username });
+});
+
+// ── GET /api/profile — get current user's profile ─────────────────────────
+app.get('/api/profile', async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
+
+    const user = await getUserFromToken(req);
+    if (!user) return res.status(401).json({ error: 'Not authenticated.' });
+
+    const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', user.id)
+        .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ profile: data });
+});
+
 
 const rooms = new Map();
 
