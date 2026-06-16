@@ -26,7 +26,7 @@ const io     = new Server(server, { cors: { origin: '*', methods: ['GET','POST']
 
 app.use(cors());
 app.use(express.json());
-app.get('/', (req, res) => res.send('Wordle server running ✅ — Duel + Party modes active'));
+app.get('/', (req, res) => res.send('Wordle server running ✅ — Solo · Duel · Challenge · Party · Daily modes active'));
 
 // Keep-alive: ping self every 5 minutes so Railway doesn't spin down
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -303,9 +303,11 @@ app.get('/api/daily/status', async (req, res) => {
     if (!user) return res.status(401).json({ error: 'Not authenticated.' });
 
     // Client sends their local date so reset happens at local midnight
-    const clientDate = req.query.date;
+    // Fallback to UTC date if not provided (old clients / cached pages)
+    let clientDate = req.query.date;
     if (!clientDate || !validateDateStr(clientDate)) {
-        return res.status(400).json({ error: 'Invalid or missing date parameter.' });
+        const d = new Date();
+        clientDate = d.toISOString().split('T')[0]; // YYYY-MM-DD UTC
     }
 
     const word = getWordForDate(clientDate);
@@ -420,9 +422,11 @@ app.get('/api/daily/leaderboard', async (req, res) => {
     if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
 
     // Client sends their local date so leaderboard shows their day's results
-    const clientDate = req.query.date;
+    // Fallback to UTC date if not provided
+    let clientDate = req.query.date;
     if (!clientDate || !validateDateStr(clientDate)) {
-        return res.status(400).json({ error: 'Invalid or missing date parameter.' });
+        const d = new Date();
+        clientDate = d.toISOString().split('T')[0];
     }
 
     // Query directly using the client's date instead of the view's current_date
