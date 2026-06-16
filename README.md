@@ -1,6 +1,6 @@
 # Wordle Duel Backend
 
-A real-time multiplayer Wordle game backend built with Express.js and Socket.IO.
+A real-time multiplayer WordForge game backend built with Express.js and Socket.IO.
 
 ## Features
 

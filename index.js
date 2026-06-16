@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// index.js — Combined Wordle server
+// index.js — Combined WordForge server
 // Runs BOTH duel mode and party mode on the same port / same Socket.io instance
 // ─────────────────────────────────────────────────────────────────────────────
 const express  = require('express');
@@ -26,7 +26,7 @@ const io     = new Server(server, { cors: { origin: '*', methods: ['GET','POST']
 
 app.use(cors());
 app.use(express.json());
-app.get('/', (req, res) => res.send('Wordle server running ✅ — Solo · Duel · Challenge · Party · Daily modes active'));
+app.get('/', (req, res) => res.send('WordForge server running ✅ — Solo · Duel · Challenge · Party · Daily modes active'));
 
 // Keep-alive: ping self every 5 minutes so Railway doesn't spin down
 const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -932,4 +932,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Wordle server on port ${PORT} — Duel + Party active`));
+server.listen(PORT, () => console.log(`WordForge server on port ${PORT} — Duel + Party active`));
