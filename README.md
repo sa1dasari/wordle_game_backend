@@ -1,4 +1,4 @@
-# Wordle Duel Backend
+# WordForge Duel Backend
 
 A real-time multiplayer WordForge game backend built with Express.js and Socket.IO.
 
