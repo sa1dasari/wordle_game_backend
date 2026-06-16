@@ -259,9 +259,15 @@ function getTodaysWord() {
 }
 
 function getTodayDateString() {
+    // Use EST (UTC-5) for daily reset at midnight EST
     const d = new Date();
-    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
-        .toISOString().split('T')[0]; // YYYY-MM-DD
+    const estOffset = -5 * 60; // EST in minutes (not accounting for DST — keeps it simple)
+    const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+    const estDate = new Date(utc + (estOffset * 60000));
+    const yyyy = estDate.getFullYear();
+    const mm   = String(estDate.getMonth() + 1).padStart(2, '0');
+    const dd   = String(estDate.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
 }
 
 // In-memory per-session guess tracking (keyed by user_id)
@@ -306,7 +312,9 @@ app.get('/api/daily/status', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     if (data) {
-        return res.json({ played: true, result: data });
+        // Include the word in the result when game is over
+        const resultWithWord = { ...data, word: getTodaysWord() };
+        return res.json({ played: true, result: resultWithWord });
     }
 
     // Not played yet — return current in-progress session (if any)
