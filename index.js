@@ -340,29 +340,39 @@ app.get('/api/daily/status', async (req, res) => {
 app.post('/api/daily/guess', async (req, res) => {
     if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
 
-    const user = await getUserFromToken(req);
-    if (!user) return res.status(401).json({ error: 'Not authenticated.' });
+    let user;
+    try {
+        user = await getUserFromToken(req);
+    } catch (authErr) {
+        console.error('Auth error in /api/daily/guess:', authErr);
+        return res.status(500).json({ error: 'Auth service error: ' + authErr.message });
+    }
+    if (!user) return res.status(401).json({ error: 'Not authenticated. Please sign in again.' });
 
     const { guess } = req.body;
+    let clientDate = req.body.date;
     if (!guess || typeof guess !== 'string') {
         return res.status(400).json({ error: 'Missing guess.' });
     }
+    // Fallback to UTC date if client date not provided
+    if (!clientDate || !validateDateStr(clientDate)) {
+        const d = new Date();
+        clientDate = d.toISOString().split('T')[0];
+    }
 
-    const today = getTodayDateString();
-
-    // Check if already completed today
+    // Check if already completed this date
     const { data: existing } = await supabase
         .from('daily_results')
         .select('id')
         .eq('user_id', user.id)
-        .eq('play_date', today)
+        .eq('play_date', clientDate)
         .maybeSingle();
 
     if (existing) {
         return res.status(403).json({ error: "You've already played today's word." });
     }
 
-    const word = getTodaysWord();
+    const word = getWordForDate(clientDate);
     const upperGuess = guess.toUpperCase().trim();
 
     if (upperGuess.length !== 5) {
@@ -374,9 +384,10 @@ app.post('/api/daily/guess', async (req, res) => {
         return res.status(400).json({ error: 'Not a valid word.', invalid: true });
     }
 
-    const session = getDailySession(user.id);
+    // Session keyed by user+date so different dates don't share state
+    const sessionKey = `${user.id}:${clientDate}`;
+    const session = getDailySession(sessionKey);
 
-    // Prevent replay/extra guesses beyond 6
     if (session.guesses.length >= 6) {
         return res.status(403).json({ error: 'No guesses remaining.' });
     }
@@ -393,25 +404,22 @@ app.post('/api/daily/guess', async (req, res) => {
     if (gameOver) {
         const timeTaken = Math.round((Date.now() - session.startedAt) / 1000);
 
-        // Save result to Supabase
         const { error: insertError } = await supabase.from('daily_results').insert({
-            user_id: user.id,
-            play_date: today,
-            guesses: session.guesses,
-            guess_count: isCorrect ? guessCount : 7, // 7 = failed convention
-            solved: isCorrect,
-            time_taken_seconds: timeTaken,
+            user_id:            user.id,
+            play_date:          clientDate,
+            guesses:            session.guesses,
+            guess_count:        isCorrect ? guessCount : 7,
+            solved:             isCorrect,
+            time_taken_seconds: isCorrect ? timeTaken : null,
         });
 
         if (insertError) {
-            console.error('Failed to save daily result:', insertError.message);
+            console.error('Failed to save daily result:', insertError.message, insertError);
         }
 
-        // Reveal the word on game over
-        response.word = word;
-
-        // Clear session
-        dailySessions.delete(user.id);
+        response.word      = word;
+        response.timeTaken = isCorrect ? timeTaken : null;
+        dailySessions.delete(sessionKey);
     }
 
     res.json(response);
