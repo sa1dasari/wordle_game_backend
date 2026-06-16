@@ -248,26 +248,27 @@ const ANSWER_WORDS = WORDS5;
 // Epoch date — day 0 of the daily word rotation
 const DAILY_EPOCH = new Date('2024-01-01T00:00:00Z');
 
-function getDailyWordIndex(date = new Date()) {
-    const utcDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-    const daysSinceEpoch = Math.floor((utcDate - DAILY_EPOCH) / (1000 * 60 * 60 * 24));
-    return ((daysSinceEpoch % ANSWER_WORDS.length) + ANSWER_WORDS.length) % ANSWER_WORDS.length;
+// ── Daily word by local date ─────────────────────────────────────────────
+// Word is determined by the user's local calendar date (sent from client)
+// Same date = same word globally, resets at local midnight for each user
+
+function getWordForDate(dateStr) {
+    // dateStr is YYYY-MM-DD from client's local date
+    const date = new Date(dateStr + 'T00:00:00Z'); // treat as UTC midnight for indexing
+    const daysSinceEpoch = Math.floor((date - DAILY_EPOCH) / (1000 * 60 * 60 * 24));
+    const index = ((daysSinceEpoch % ANSWER_WORDS.length) + ANSWER_WORDS.length) % ANSWER_WORDS.length;
+    return ANSWER_WORDS[index];
 }
 
-function getTodaysWord() {
-    return ANSWER_WORDS[getDailyWordIndex()];
-}
-
-function getTodayDateString() {
-    // Use EST (UTC-5) for daily reset at midnight EST
-    const d = new Date();
-    const estOffset = -5 * 60; // EST in minutes (not accounting for DST — keeps it simple)
-    const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
-    const estDate = new Date(utc + (estOffset * 60000));
-    const yyyy = estDate.getFullYear();
-    const mm   = String(estDate.getMonth() + 1).padStart(2, '0');
-    const dd   = String(estDate.getDate()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd}`;
+function validateDateStr(dateStr) {
+    // Validate YYYY-MM-DD format and that it's a real date within 1 day of server time
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+    const d = new Date(dateStr + 'T00:00:00Z');
+    if (isNaN(d.getTime())) return false;
+    // Allow dates within ±2 days of server UTC date (covers all timezones)
+    const serverNow = new Date();
+    const diffDays = Math.abs((d - serverNow) / (1000 * 60 * 60 * 24));
+    return diffDays <= 2;
 }
 
 // In-memory per-session guess tracking (keyed by user_id)
@@ -276,11 +277,11 @@ function getTodayDateString() {
 // but the unique(user_id, play_date) DB constraint prevents double-scoring.
 const dailySessions = new Map(); // user_id -> { guesses: [], startedAt }
 
-function getDailySession(userId) {
-    if (!dailySessions.has(userId)) {
-        dailySessions.set(userId, { guesses: [], startedAt: Date.now() });
+function getDailySession(sessionKey) {
+    if (!dailySessions.has(sessionKey)) {
+        dailySessions.set(sessionKey, { guesses: [], startedAt: Date.now() });
     }
-    return dailySessions.get(userId);
+    return dailySessions.get(sessionKey);
 }
 
 // Verify a Supabase JWT and return the user, or null
@@ -301,24 +302,31 @@ app.get('/api/daily/status', async (req, res) => {
     const user = await getUserFromToken(req);
     if (!user) return res.status(401).json({ error: 'Not authenticated.' });
 
-    const today = getTodayDateString();
+    // Client sends their local date so reset happens at local midnight
+    const clientDate = req.query.date;
+    if (!clientDate || !validateDateStr(clientDate)) {
+        return res.status(400).json({ error: 'Invalid or missing date parameter.' });
+    }
+
+    const word = getWordForDate(clientDate);
+
     const { data, error } = await supabase
         .from('daily_results')
-        .select('guess_count, solved, guesses')
+        .select('guess_count, solved, guesses, time_taken_seconds')
         .eq('user_id', user.id)
-        .eq('play_date', today)
+        .eq('play_date', clientDate)
         .maybeSingle();
 
     if (error) return res.status(500).json({ error: error.message });
 
     if (data) {
-        // Include the word in the result when game is over
-        const resultWithWord = { ...data, word: getTodaysWord() };
+        const resultWithWord = { ...data, word };
         return res.json({ played: true, result: resultWithWord });
     }
 
-    // Not played yet — return current in-progress session (if any)
-    const session = dailySessions.get(user.id);
+    // Not played yet — return in-progress session if any
+    const sessionKey = `${user.id}:${clientDate}`;
+    const session = dailySessions.get(sessionKey);
     res.json({
         played: false,
         wordLength: 5,
@@ -411,13 +419,47 @@ app.post('/api/daily/guess', async (req, res) => {
 app.get('/api/daily/leaderboard', async (req, res) => {
     if (!supabase) return res.status(503).json({ error: 'Daily mode not configured.' });
 
+    // Client sends their local date so leaderboard shows their day's results
+    const clientDate = req.query.date;
+    if (!clientDate || !validateDateStr(clientDate)) {
+        return res.status(400).json({ error: 'Invalid or missing date parameter.' });
+    }
+
+    // Query directly using the client's date instead of the view's current_date
     const { data, error } = await supabase
-        .from('leaderboard_today')
-        .select('*')
+        .from('daily_results')
+        .select(`
+            guess_count,
+            solved,
+            time_taken_seconds,
+            created_at,
+            profiles!inner(username, current_streak)
+        `)
+        .eq('play_date', clientDate)
+        .order('solved',              { ascending: false })
+        .order('guess_count',         { ascending: true })
+        .order('time_taken_seconds',  { ascending: true, nullsFirst: false })
+        .order('created_at',          { ascending: true })
         .limit(50);
 
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ leaderboard: data });
+
+    // Add dense_rank
+    let rank = 1, prevKey = null;
+    const leaderboard = (data || []).map((row, idx) => {
+        const key = `${row.solved}-${row.guess_count}-${row.time_taken_seconds}`;
+        if (key !== prevKey) { rank = idx + 1; prevKey = key; }
+        return {
+            username:           row.profiles.username,
+            current_streak:     row.profiles.current_streak,
+            guess_count:        row.guess_count,
+            solved:             row.solved,
+            time_taken_seconds: row.time_taken_seconds,
+            rank,
+        };
+    });
+
+    res.json({ leaderboard });
 });
 
 // ── GET /api/daily/leaderboard/alltime — all-time leaderboard ────────────
