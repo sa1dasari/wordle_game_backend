@@ -252,12 +252,27 @@ const DAILY_EPOCH = new Date('2024-01-01T00:00:00Z');
 // Word is determined by the user's local calendar date (sent from client)
 // Same date = same word globally, resets at local midnight for each user
 
+// Shuffle ANSWER_WORDS with a fixed seed so:
+// 1. Daily words are not alphabetically sequential
+// 2. The same shuffle is produced every server restart (deterministic)
+function seededShuffle(arr, seed) {
+    const a = [...arr];
+    let s = seed;
+    for (let i = a.length - 1; i > 0; i--) {
+        s = (s * 1664525 + 1013904223) & 0xffffffff;
+        const j = Math.abs(s) % (i + 1);
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+const SHUFFLED_ANSWERS = seededShuffle(ANSWER_WORDS, 42);
+
 function getWordForDate(dateStr) {
     // dateStr is YYYY-MM-DD from client's local date
-    const date = new Date(dateStr + 'T00:00:00Z'); // treat as UTC midnight for indexing
+    const date = new Date(dateStr + 'T00:00:00Z');
     const daysSinceEpoch = Math.floor((date - DAILY_EPOCH) / (1000 * 60 * 60 * 24));
-    const index = ((daysSinceEpoch % ANSWER_WORDS.length) + ANSWER_WORDS.length) % ANSWER_WORDS.length;
-    return ANSWER_WORDS[index];
+    const index = ((daysSinceEpoch % SHUFFLED_ANSWERS.length) + SHUFFLED_ANSWERS.length) % SHUFFLED_ANSWERS.length;
+    return SHUFFLED_ANSWERS[index];
 }
 
 function validateDateStr(dateStr) {
