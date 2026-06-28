@@ -417,7 +417,11 @@ app.post('/api/daily/guess', async (req, res) => {
     let response = { guess: upperGuess, result, guessCount, isCorrect, gameOver };
 
     if (gameOver) {
-        const timeTaken = Math.round((Date.now() - session.startedAt) / 1000);
+        // Use client-reported active time (excludes time app was backgrounded)
+        // Fall back to server wall-clock if client didn't send it
+        const clientActiveSeconds = (typeof req.body.activeSeconds === 'number' && req.body.activeSeconds > 0)
+            ? Math.round(req.body.activeSeconds)
+            : Math.round((Date.now() - session.startedAt) / 1000);
 
         const { error: insertError } = await supabase.from('daily_results').insert({
             user_id:            user.id,
@@ -425,7 +429,7 @@ app.post('/api/daily/guess', async (req, res) => {
             guesses:            session.guesses,
             guess_count:        isCorrect ? guessCount : 7,
             solved:             isCorrect,
-            time_taken_seconds: isCorrect ? timeTaken : null,
+            time_taken_seconds: isCorrect ? clientActiveSeconds : null,
         });
 
         if (insertError) {
